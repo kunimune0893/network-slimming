@@ -6,7 +6,7 @@ import torch.nn as nn
 from torch.autograd import Variable
 from torchvision import datasets, transforms
 from models import *
-
+import binaryconnect
 
 # Prune settings
 parser = argparse.ArgumentParser(description='PyTorch Slimming CIFAR prune')
@@ -24,6 +24,8 @@ parser.add_argument('--model', default='', type=str, metavar='PATH',
                     help='path to the model (default: none)')
 parser.add_argument('--save', default='', type=str, metavar='PATH',
                     help='path to save pruned model (default: none)')
+parser.add_argument('--binarize', action='store_true', default=False,
+                    help='Binary Connect')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -35,15 +37,21 @@ model = densenet(depth=args.depth, dataset=args.dataset)
 
 if args.cuda:
     model.cuda()
+
+bin_op = None
+if args.binarize:
+    bin_op = binaryconnect.BC( model )
+
 if args.model:
     if os.path.isfile(args.model):
         print("=> loading checkpoint '{}'".format(args.model))
-        checkpoint = torch.load(args.model)
+        checkpoint = torch.load(args.model, map_location='cpu')
         args.start_epoch = checkpoint['epoch']
         best_prec1 = checkpoint['best_prec1']
         model.load_state_dict(checkpoint['state_dict'])
         print("=> loaded checkpoint '{}' (epoch {}) Prec1: {:f}"
               .format(args.model, checkpoint['epoch'], best_prec1))
+        print( "=> loaded parameters: {}".format(sum([param.nelement() for param in model.parameters()])) )
     else:
         print("=> no checkpoint found at '{}'".format(args.resume))
 
@@ -64,13 +72,15 @@ y, i = torch.sort(bn)
 thre_index = int(total * args.percent)
 thre = y[thre_index]
 
+print( "BN total=", total, ", thre_index=", thre_index )
+
 pruned = 0
 cfg = []
 cfg_mask = []
 for k, m in enumerate(model.modules()):
     if isinstance(m, nn.BatchNorm2d):
         weight_copy = m.weight.data.abs().clone()
-        mask = weight_copy.gt(thre).float().cuda()
+        mask = weight_copy.gt(thre).float()
         pruned = pruned + mask.shape[0] - torch.sum(mask)
         m.weight.data.mul_(mask)
         m.bias.data.mul_(mask)
@@ -83,14 +93,14 @@ for k, m in enumerate(model.modules()):
 
 pruned_ratio = pruned/total
 
-print('Pre-processing Successful!')
+print('Pre-processing Successful!', ": pruned_ratio=", pruned_ratio)
 
 # simple test model after Pre-processing prune (simple set BN scales to zeros)
-def test(model):
+def test( model, bin_op=None ):
     kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
     if args.dataset == 'cifar10':
         test_loader = torch.utils.data.DataLoader(
-            datasets.CIFAR10('./data.cifar10', train=False, transform=transforms.Compose([
+            datasets.CIFAR10('../data', train=False, transform=transforms.Compose([
                 transforms.ToTensor(),
                 transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))])),
             batch_size=args.test_batch_size, shuffle=False, **kwargs)
@@ -102,21 +112,30 @@ def test(model):
             batch_size=args.test_batch_size, shuffle=False, **kwargs)
     else:
         raise ValueError("No valid dataset is given.")
+    
     model.eval()
     correct = 0
-    for data, target in test_loader:
-        if args.cuda:
-            data, target = data.cuda(), target.cuda()
-        data, target = Variable(data, volatile=True), Variable(target)
-        output = model(data)
-        pred = output.data.max(1, keepdim=True)[1] # get the index of the max log-probability
-        correct += pred.eq(target.data.view_as(pred)).cpu().sum()
-
+    
+    if bin_op is not None:
+        bin_op.binarization()
+    
+    with torch.no_grad():
+        for data, target in test_loader:
+            if args.cuda:
+                data, target = data.cuda(), target.cuda()
+            output = model(data)
+            _, predict = torch.max(output.data, 1)
+            correct += (predict == target).sum().item()
+            break
+    
+    if bin_op is not None:
+        bin_op.restore()
+    
     print('\nTest set: Accuracy: {}/{} ({:.1f}%)\n'.format(
         correct, len(test_loader.dataset), 100. * correct / len(test_loader.dataset)))
     return correct / float(len(test_loader.dataset))
 
-acc = test(model)
+acc = test(model, bin_op)
 
 print("Cfg:")
 print(cfg)
@@ -132,6 +151,12 @@ with open(savepath, "w") as fp:
     fp.write("Configuration: \n"+str(cfg)+"\n")
     fp.write("Number of parameters: \n"+str(num_parameters)+"\n")
     fp.write("Test accuracy: \n"+str(acc))
+
+num_parameters_old = sum([param.nelement() for param in model.parameters()])
+
+print("Configuration: \n"+str(cfg)+"\n")
+print("Number of parameters: \n" + str(num_parameters_old) + " -> " + str(num_parameters) + "\n")
+print("Test accuracy: \n"+str(acc))
 
 old_modules = list(model.modules())
 new_modules = list(newmodel.modules())
